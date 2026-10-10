@@ -25,9 +25,9 @@ public sealed class ResourceTransferTests
     {
         var channel = Mock.Of<INetChannel>(c => c.IsConnected);
         var transfers = new Mock<ITransferManager>();
-        MemoryStream download = null!;
+        CapturedDownload download = null!;
         transfers.Setup(t => t.StartTransfer(It.IsAny<INetChannel>(), It.IsAny<TransferStartInfo>()))
-            .Returns(() => download = new MemoryStream());
+            .Returns(() => download = new CapturedDownload());
         var (manager, log) = Manager(transfers.Object);
         var net = new Mock<IServerNetManager>();
         net.SetupGet(n => n.Channels).Returns(new[] { channel });
@@ -47,8 +47,10 @@ public sealed class ResourceTransferTests
             channel, upload));
         Assert.That(published, Is.True);
         foreach (var (path, _) in files) Assert.That(manager.FileExists(path), Is.True);
+        await download.Finished.Task.WaitAsync(TimeSpan.FromSeconds(10));
         await CheckDownload(download.ToArray(), 0);
         Assert.That(manager.SendToNewUser(channel), Is.True);
+        await download.Finished.Task.WaitAsync(TimeSpan.FromSeconds(10));
         await CheckDownload(download.ToArray(), NetworkResourceManager.AckInitial);
         log.Verify(l => l.Warning(It.IsAny<string>()), Times.Never);
         manager.Dispose();
@@ -104,7 +106,13 @@ public sealed class ResourceTransferTests
         transfers.Setup(t => t.StartTransfer(It.IsAny<INetChannel>(), It.IsAny<TransferStartInfo>()))
             .Throws(new IOException("Injected disconnect before transfer"));
         var (manager, log) = Manager(transfers.Object);
-        await manager.SendToPlayer(Mock.Of<INetChannel>(), [(new ResPath("song.ogg"), new byte[16385])]);
+        var channel = new Mock<INetChannel>();
+        channel.SetupGet(c => c.IsConnected).Returns(true);
+        var acknowledged = false;
+        manager.AckReceived += (_, _) => acknowledged = true;
+        await manager.SendToPlayer(channel.Object, [(new ResPath("song.ogg"), new byte[16385])], NetworkResourceManager.AckInitial);
+        channel.Verify(c => c.Disconnect("Failed to download server resources"), Times.Once);
+        Assert.That(acknowledged, Is.False);
         log.Verify(l => l.Warning(It.Is<string>(s => s.Contains("Resource download"))), Times.Once);
         manager.Dispose();
     }
@@ -148,5 +156,15 @@ public sealed class ResourceTransferTests
     private sealed class OriginalClientReader : SharedNetworkResourceManager
     {
         public Task<List<(ResPath Relative, byte[] Data)>> Read(Stream stream) => IngestFileStream(stream);
+    }
+
+    private sealed class CapturedDownload : MemoryStream
+    {
+        public readonly TaskCompletionSource Finished = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        protected override void Dispose(bool disposing)
+        {
+            base.Dispose(disposing);
+            if (disposing) Finished.TrySetResult();
+        }
     }
 }

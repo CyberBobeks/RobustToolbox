@@ -196,12 +196,14 @@ public sealed class NetworkResourceManager : SharedNetworkResourceManager
             BinaryPrimitives.WriteInt32LittleEndian(ackBytes, ack);
             await stream.WriteAsync(ackBytes);
 
-            await WriteFileStream(stream, files);
+            await Task.Run(() => WriteFileStream(stream, files)); // DS14: Keep bulk copying and serialization off the game thread.
         // DS14-start
         }
         catch (Exception e)
         {
             Sawmill.Warning($"Resource download to {channel} failed: {e}");
+            if (channel.IsConnected)
+                channel.Disconnect("Failed to download server resources");
         }
         // DS14-end
     }

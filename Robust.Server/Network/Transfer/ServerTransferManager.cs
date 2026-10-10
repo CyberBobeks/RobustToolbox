@@ -49,6 +49,7 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
     private void RxTransferData(MsgTransferData message)
     {
         if (!_onlinePlayers.TryGetValue(message.MsgChannel.UserId, out var player)
+            || player.Channel != message.MsgChannel // DS14
             || player.Impl is not ServerTransferImplLidgren lidgren) // DS14
         {
             message.MsgChannel.Disconnect("Not lidgren");
@@ -71,6 +72,7 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
     private void RxTransferAckInit(MsgTransferAckInit message)
     {
         if (!_onlinePlayers.TryGetValue(message.MsgChannel.UserId, out var player)
+            || player.Channel != message.MsgChannel // DS14
             || player.Impl is not ServerTransferImplLidgren lidgren) // DS14
         {
             message.MsgChannel.Disconnect("Not lidgren");
@@ -82,8 +84,10 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
 
     public Stream StartTransfer(INetChannel channel, TransferStartInfo startInfo)
     {
-        if (!_onlinePlayers.TryGetValue(channel.UserId, out var player))
+        if (!_onlinePlayers.TryGetValue(channel.UserId, out var player) || player.Channel != channel) // DS14
             throw new InvalidOperationException("Player is not connected yet!");
+        if (!RegisteredKeys.ContainsKey(startInfo.MessageKey)) // DS14
+            throw new ArgumentException("Transfer key is not registered", nameof(startInfo)); // DS14
 
         return player.Impl.StartTransfer(startInfo);
     }
@@ -155,6 +159,7 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
         var datum = new Player
         {
             Impl = impl,
+            Channel = channel, // DS14
         };
 
         // DS14-start
@@ -176,7 +181,10 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
 
     private void NetManagerOnDisconnect(object? sender, NetDisconnectedArgs e)
     {
-        if (!_onlinePlayers.TryRemove(e.Channel.UserId, out var player)) // DS14
+        // DS14-start: A delayed disconnect from an old session must not remove its replacement.
+        if (!_onlinePlayers.TryGetValue(e.Channel.UserId, out var player) || player.Channel != e.Channel ||
+            !_onlinePlayers.TryRemove(e.Channel.UserId, out player))
+        // DS14-end
             return;
 
         Sawmill.Debug("Cleaning up connection for channel {Player} that disconnected", e.Channel);
@@ -186,5 +194,6 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
     private sealed class Player
     {
         public required BaseTransferImpl Impl;
+        public required INetChannel Channel; // DS14
     }
 }

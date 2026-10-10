@@ -114,6 +114,34 @@ public sealed class TransferTests
     }
 
     [Test]
+    public async Task DisposeCancelsPendingReadBeforeDrainingTheQueue()
+    {
+        using var fixture = new Fixture();
+        var first = new TaskCompletionSource<Stream>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var next = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var received = 0;
+        fixture.Manager.RegisterTransferMessage(Key, ev =>
+        {
+            if (Interlocked.Increment(ref received) == 1) first.TrySetResult(ev.DataStream);
+            else { ev.DataStream.Dispose(); next.TrySetResult(); }
+        });
+        fixture.Impl.BeginRead();
+        fixture.Socket.Enqueue(Header(1, 1), true);
+        var stream = await first.Task.WaitAsync(Timeout);
+        var pending = stream.ReadAsync(new byte[1]).AsTask();
+        stream.Dispose();
+        Assert.ThrowsAsync<OperationCanceledException>(async () => await pending.WaitAsync(Timeout));
+        for (var i = 0; i < 12; i++)
+        {
+            fixture.Socket.Enqueue(Header(1, i == 11 ? (byte)6 : (byte)4), true);
+            fixture.Socket.Enqueue(new byte[16384], true);
+        }
+        fixture.Socket.Enqueue(Header(2, 3), true);
+        await next.Task.WaitAsync(Timeout);
+        fixture.Net.Verify(c => c.Disconnect(It.IsAny<string>()), Times.Never);
+    }
+
+    [Test]
     public async Task ServerDisconnectClosesPendingRead()
     {
         using var fixture = new Fixture();
@@ -146,6 +174,35 @@ public sealed class TransferTests
         Assert.That(fixture.Socket.Sent, Is.EqualTo(sent));
     }
 
+    [TestCase(1)]
+    [TestCase(2)]
+    public async Task FailedFrameIsNotRetriedDuringDispose(int failedMessage)
+    {
+        using var fixture = new Fixture();
+        fixture.Socket.FailOnSend = failedMessage;
+        var stream = fixture.Impl.StartTransfer(new TransferStartInfo { MessageKey = Key });
+        Assert.ThrowsAsync<IOException>(async () => await stream.WriteAsync(new byte[16384]));
+        Assert.That(stream.CanWrite, Is.False);
+        await stream.DisposeAsync();
+        Assert.That(fixture.Socket.Sent, Is.EqualTo(failedMessage), "Neither Start nor Finish may follow a failed frame.");
+        fixture.Net.Verify(c => c.Disconnect(It.IsAny<string>()), Times.Once);
+    }
+
+    [Test]
+    public async Task FailedFrameStopsOtherStreamsOnTheSocket()
+    {
+        using var fixture = new Fixture();
+        fixture.Socket.FailOnSend = 2;
+        await using var first = fixture.Impl.StartTransfer(new TransferStartInfo { MessageKey = Key });
+        await using var second = fixture.Impl.StartTransfer(new TransferStartInfo { MessageKey = Key });
+        Assert.ThrowsAsync<IOException>(async () => await first.WriteAsync(new byte[16384]));
+        Assert.ThrowsAsync<IOException>(async () => await second.WriteAsync(new byte[1]));
+        await first.DisposeAsync();
+        await second.DisposeAsync();
+        Assert.That(fixture.Socket.Sent, Is.EqualTo(2));
+        fixture.Net.Verify(c => c.Disconnect(It.IsAny<string>()), Times.Once);
+    }
+
     [Test]
     public void FailedDisposeCannotCrashFinalizerThread()
     {
@@ -158,15 +215,30 @@ public sealed class TransferTests
             GC.WaitForPendingFinalizers();
         }
         Assert.That(weak.IsAlive, Is.False);
+        Assert.That(fixture.Socket.Sent, Is.EqualTo(1));
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static WeakReference FailDispose(TestImpl impl)
     {
         var stream = impl.StartTransfer(new TransferStartInfo { MessageKey = Key });
-        try { stream.Dispose(); }
+        try { stream.DisposeAsync().AsTask().GetAwaiter().GetResult(); }
         catch (Exception) { }
         return new WeakReference(stream);
+    }
+
+    [Test]
+    public async Task SendingRequiresAsyncOperationsAndSyncDisposeNeverWaits()
+    {
+        using var fixture = new Fixture();
+        var stream = fixture.Impl.StartTransfer(new TransferStartInfo { MessageKey = Key });
+        Assert.Throws<NotSupportedException>(() => stream.Write(new byte[1]));
+        Assert.Throws<NotSupportedException>(() => stream.Flush());
+        await stream.WriteAsync(new byte[16384], 0, 16384);
+        Assert.That(fixture.Socket.Sent, Is.EqualTo(2));
+        stream.Dispose();
+        Assert.That(fixture.Socket.Sent, Is.EqualTo(2));
+        fixture.Net.Verify(c => c.Disconnect(It.IsAny<string>()), Times.Once);
     }
 
     [TestCase(0)]
@@ -388,6 +460,7 @@ public sealed class TransferTests
         private int _offset;
         public int Sent;
         public bool FailSend;
+        public int FailOnSend;
         public override WebSocketCloseStatus? CloseStatus => null;
         public override string? CloseStatusDescription => null;
         public override string? SubProtocol => null;
@@ -401,8 +474,10 @@ public sealed class TransferTests
             => Task.CompletedTask;
         public override Task SendAsync(ArraySegment<byte> data, WebSocketMessageType type, bool end, CancellationToken cancel)
         {
-            Interlocked.Increment(ref Sent);
-            return FailSend ? Task.FromException(new IOException("Injected disconnected socket")) : Task.CompletedTask;
+            var sent = Interlocked.Increment(ref Sent);
+            return FailSend || sent == FailOnSend
+                ? Task.FromException(new IOException("Injected disconnected socket"))
+                : Task.CompletedTask;
         }
         public override async Task<WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancel)
         {

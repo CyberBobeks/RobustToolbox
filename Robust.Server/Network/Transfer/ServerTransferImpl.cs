@@ -24,6 +24,7 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
     private readonly Dictionary<long, ChannelWriter<ArraySegment<byte>>> _receivingChannels = [];
     private readonly Lock _receivingLock = new();
     private bool _disposed;
+    private int _sendFailed;
 
     private readonly SemaphoreSlim _socketSemaphore = new(1, 1);
 
@@ -116,100 +117,126 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
     private sealed class ReceiveStream : SaneStream
     {
         private readonly ChannelReader<ArraySegment<byte>> _bufferChannel;
+        private readonly SemaphoreSlim _readLock = new(1, 1);
+        private readonly CancellationTokenSource _disposeCancel = new();
+        private readonly CancellationToken _disposeToken;
 
         private ArraySegment<byte> _currentBuffer;
-        private bool _disposed;
+        private int _disposed;
 
-        public override bool CanRead => true;
+        public override bool CanRead => Volatile.Read(ref _disposed) == 0;
 
         public ReceiveStream(ChannelReader<ArraySegment<byte>> bufferChannel)
         {
             _bufferChannel = bufferChannel;
+            _disposeToken = _disposeCancel.Token;
         }
 
         public override int Read(Span<byte> buffer)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            var read = 0;
-            var remainingSpan = buffer;
-
-            while (remainingSpan.Length > 0)
+            ObjectDisposedException.ThrowIf(!CanRead, this);
+            _readLock.Wait(_disposeToken);
+            try
             {
-                if (_currentBuffer.Array == null || _currentBuffer.Count <= 0)
+                ObjectDisposedException.ThrowIf(!CanRead, this);
+                var read = 0;
+                var remainingSpan = buffer;
+
+                while (remainingSpan.Length > 0)
                 {
-                    if (_currentBuffer.Array != null)
+                    if (_currentBuffer.Array == null || _currentBuffer.Count <= 0)
                     {
-                        ArrayPool<byte>.Shared.Return(_currentBuffer.Array);
-                        _currentBuffer = default;
+                        if (_currentBuffer.Array != null)
+                        {
+                            ArrayPool<byte>.Shared.Return(_currentBuffer.Array);
+                            _currentBuffer = default;
+                        }
+
+                        if (!_bufferChannel.TryRead(out _currentBuffer))
+                        {
+                            // Only block if we haven't read any bytes yet.
+                            if (read > 0 || !ReadNewBufferSync())
+                                return read;
+                        }
                     }
 
-                    if (!_bufferChannel.TryRead(out _currentBuffer))
-                    {
-                        // Only block if we haven't read any bytes yet.
-                        if (read > 0 || !ReadNewBufferSync())
-                            return read;
-                    }
+                    DebugTools.Assert(_currentBuffer.Array != null);
+
+                    var remainingBuffer = _currentBuffer.Count;
+                    var thisRead = Math.Min(remainingSpan.Length, remainingBuffer);
+
+                    _currentBuffer.AsSpan(0, thisRead).CopyTo(remainingSpan);
+                    remainingSpan = remainingSpan[thisRead..];
+                    _currentBuffer = _currentBuffer[thisRead..];
+                    read += thisRead;
                 }
 
-                DebugTools.Assert(_currentBuffer.Array != null);
-
-                var remainingBuffer = _currentBuffer.Count;
-                var thisRead = Math.Min(remainingSpan.Length, remainingBuffer);
-
-                _currentBuffer.AsSpan(0, thisRead).CopyTo(remainingSpan);
-                remainingSpan = remainingSpan[thisRead..];
-                _currentBuffer = _currentBuffer[thisRead..];
-                read += thisRead;
+                return read;
             }
-
-            return read;
+            finally
+            {
+                _readLock.Release();
+            }
         }
 
         public override async ValueTask<int> ReadAsync(
             Memory<byte> buffer,
             CancellationToken cancellationToken = default)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            var read = 0;
-            var remainingSpan = buffer;
-
-            while (remainingSpan.Length > 0)
+            ObjectDisposedException.ThrowIf(!CanRead, this);
+            using var linked = cancellationToken.CanBeCanceled
+                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeToken)
+                : null;
+            var cancel = linked?.Token ?? _disposeToken;
+            await _readLock.WaitAsync(cancel).ConfigureAwait(false);
+            try
             {
-                if (_currentBuffer.Array == null || _currentBuffer.Count <= 0)
+                ObjectDisposedException.ThrowIf(!CanRead, this);
+                var read = 0;
+                var remainingSpan = buffer;
+
+                while (remainingSpan.Length > 0)
                 {
-                    if (_currentBuffer.Array != null)
+                    if (_currentBuffer.Array == null || _currentBuffer.Count <= 0)
                     {
-                        ArrayPool<byte>.Shared.Return(_currentBuffer.Array);
-                        _currentBuffer = default;
+                        if (_currentBuffer.Array != null)
+                        {
+                            ArrayPool<byte>.Shared.Return(_currentBuffer.Array);
+                            _currentBuffer = default;
+                        }
+
+                        if (!_bufferChannel.TryRead(out _currentBuffer))
+                        {
+                            // Only block if we haven't read any bytes yet.
+                            if (read > 0 || !await ReadNewBufferAsync(cancel).ConfigureAwait(false))
+                                return read;
+                        }
                     }
 
-                    if (!_bufferChannel.TryRead(out _currentBuffer))
-                    {
-                        // Only block if we haven't read any bytes yet.
-                        if (read > 0 || !await ReadNewBufferAsync(cancellationToken).ConfigureAwait(false))
-                            return read;
-                    }
+                    DebugTools.Assert(_currentBuffer.Array != null);
+
+                    var remainingBuffer = _currentBuffer.Count;
+                    var thisRead = Math.Min(remainingSpan.Length, remainingBuffer);
+
+                    _currentBuffer.AsMemory(0, thisRead).CopyTo(remainingSpan);
+                    remainingSpan = remainingSpan[thisRead..];
+                    _currentBuffer = _currentBuffer[thisRead..];
+                    read += thisRead;
                 }
 
-                DebugTools.Assert(_currentBuffer.Array != null);
-
-                var remainingBuffer = _currentBuffer.Count;
-                var thisRead = Math.Min(remainingSpan.Length, remainingBuffer);
-
-                _currentBuffer.AsMemory(0, thisRead).CopyTo(remainingSpan);
-                remainingSpan = remainingSpan[thisRead..];
-                _currentBuffer = _currentBuffer[thisRead..];
-                read += thisRead;
+                return read;
             }
-
-            return read;
+            finally
+            {
+                _readLock.Release();
+            }
         }
 
         private bool ReadNewBufferSync()
         {
             DebugTools.Assert(_currentBuffer.Array == null);
 
-            var waitToRead = _bufferChannel.WaitToReadAsync();
+            var waitToRead = _bufferChannel.WaitToReadAsync(_disposeToken);
 #pragma warning disable RA0004
             var waitToReadResult = waitToRead.AsTask().Result;
 #pragma warning restore RA0004
@@ -233,19 +260,20 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
         protected override void Dispose(bool disposing)
         {
             base.Dispose(disposing);
-            if (!disposing || _disposed)
+            if (!disposing || Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
-            _disposed = true;
-            if (_currentBuffer.Array != null)
-                ArrayPool<byte>.Shared.Return(_currentBuffer.Array);
-            _currentBuffer = default;
-            // Rejected/truncated uploads must still drain their queue, or all multiplexed streams stall.
+            _disposeCancel.Cancel();
+            // The drain becomes the only reader after any cancelled read has relinquished its buffers.
             _ = DrainAsync();
         }
         private async Task DrainAsync()
         {
+            await _readLock.WaitAsync().ConfigureAwait(false);
             try
             {
+                if (_currentBuffer.Array != null)
+                    ArrayPool<byte>.Shared.Return(_currentBuffer.Array);
+                _currentBuffer = default;
                 while (await _bufferChannel.WaitToReadAsync().ConfigureAwait(false))
                 {
                     while (_bufferChannel.TryRead(out var buffer))
@@ -255,6 +283,11 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
             catch (Exception)
             {
                 // Connection shutdown can complete the queue with an error.
+            }
+            finally
+            {
+                _readLock.Release();
+                _disposeCancel.Dispose();
             }
         }
     }
@@ -271,7 +304,7 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
         private int _bufferPos;
         private bool _disposed;
 
-        public override bool CanWrite => true;
+        public override bool CanWrite => !_disposed && !Parent.SendUnavailable;
 
         public ServerSendStream(ServerTransferImpl parent, long id, string key)
         {
@@ -290,21 +323,13 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
 
         public override void Write(ReadOnlySpan<byte> buffer)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            while (buffer.Length > 0)
-            {
-                var remainingBufferSpace = _dataBuffer.AsSpan(_bufferPos);
-                var thisChunk = Math.Min(remainingBufferSpace.Length, buffer.Length);
-                var thisSpan = buffer[..thisChunk];
+            throw new NotSupportedException("Transfer streams require WriteAsync.");
+        }
 
-                thisSpan.CopyTo(remainingBufferSpace);
-                _bufferPos += thisChunk;
-
-                if (_bufferPos == _dataBuffer.Length)
-                    Flush();
-
-                buffer = buffer[thisChunk..];
-            }
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(buffer);
+            return WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
         }
 
         public override async ValueTask WriteAsync(
@@ -312,6 +337,8 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
             CancellationToken cancellationToken = default)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            Parent.CheckSendState();
+            cancellationToken.ThrowIfCancellationRequested();
             while (buffer.Length > 0)
             {
                 var remainingBufferSpace = _dataBuffer.AsSpan(_bufferPos);
@@ -330,7 +357,7 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
 
         public override void Flush()
         {
-            FlushAsync().Wait();
+            throw new NotSupportedException("Transfer streams require FlushAsync.");
         }
 
         public override async Task FlushAsync(CancellationToken cancellationToken)
@@ -341,6 +368,7 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
 
         private async ValueTask FlushAsync(bool finish, CancellationToken cancel = default)
         {
+            Parent.CheckSendState();
             var headerLength = 10;
 
             var opcode = Opcode.Transfer;
@@ -376,10 +404,13 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
             await Parent._socketSemaphore.WaitAsync(cancel).ConfigureAwait(false);
             try
             {
+                Parent.CheckSendState();
                 await SendChunkAsync(
                         new ArraySegment<byte>(_headerBuffer, 0, headerLength),
                         cancel)
                     .ConfigureAwait(false);
+                _isFirstTransmission = false;
+                Parent.CheckSendState();
 
                 if (_bufferPos > 0)
                 {
@@ -391,12 +422,17 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
                     _bufferPos = 0;
                 }
             }
+            catch
+            {
+                // Once a header may have escaped, retrying would turn the next header into its payload.
+                Parent.FailSending();
+                throw;
+            }
             finally
             {
                 Parent._socketSemaphore.Release();
             }
 
-            _isFirstTransmission = false;
         }
 
         protected abstract ValueTask SendChunkAsync(
@@ -410,8 +446,9 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
             _disposed = true;
             try
             {
-                if (disposing)
-                    FlushAsync(finish: true).AsTask().GetAwaiter().GetResult();
+                // Synchronous cleanup cancels an open transfer; only DisposeAsync sends its Finish frame.
+                if (disposing && !_isFirstTransmission && !Parent.SendUnavailable)
+                    Parent.FailSending();
             }
             finally
             {
@@ -427,7 +464,8 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
             _disposed = true;
             try
             {
-                await FlushAsync(finish: true).ConfigureAwait(false);
+                if (!Parent.SendUnavailable)
+                    await FlushAsync(finish: true).ConfigureAwait(false);
             }
             finally
             {
@@ -469,5 +507,19 @@ internal abstract class ServerTransferImpl(ISawmill sawmill, BaseTransferManager
             if (Channel.IsConnected)
                 Channel.Disconnect(reason);
         });
+    }
+
+    private bool SendUnavailable => Volatile.Read(ref _sendFailed) != 0 || Volatile.Read(ref _disposed);
+
+    private void CheckSendState()
+    {
+        if (SendUnavailable)
+            throw new IOException("The transfer connection is no longer usable.");
+    }
+
+    private void FailSending()
+    {
+        if (Interlocked.Exchange(ref _sendFailed, 1) == 0)
+            DisconnectChannel("Error in transfer socket");
     }
 }
