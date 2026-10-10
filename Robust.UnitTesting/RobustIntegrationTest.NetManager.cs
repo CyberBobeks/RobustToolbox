@@ -482,7 +482,12 @@ namespace Robust.UnitTesting
 
                 public void SendMessage(NetMessage message)
                 {
-                    _owner.ServerSendMessage(message, this);
+                    // DS14-start: Transfer streams also send through the client channel.
+                    if (_owner.IsServer)
+                        _owner.ServerSendMessage(message, this);
+                    else
+                        _owner.ClientSendMessage(message);
+                    // DS14-end
                 }
 
                 public void Disconnect(string reason)

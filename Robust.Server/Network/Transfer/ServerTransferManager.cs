@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Threading.Tasks;
@@ -21,8 +22,9 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
     private readonly IConfigurationManager _cfg;
     private readonly IStatusHost _statusHost;
     private readonly IServerNetManager _netManager;
+    private readonly ITaskManager _taskManager; // DS14
 
-    private readonly Dictionary<NetUserId, Player> _onlinePlayers = new();
+    private readonly ConcurrentDictionary<NetUserId, Player> _onlinePlayers = new(); // DS14: HTTP requests run off-thread.
 
     internal ServerTransferManager(IConfigurationManager cfg, IStatusHost statusHost, IServerNetManager netManager, ILogManager logManager, ITaskManager taskManager)
         : base(logManager, NetMessageAccept.Server, taskManager)
@@ -30,6 +32,7 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
         _cfg = cfg;
         _statusHost = statusHost;
         _netManager = netManager;
+        _taskManager = taskManager; // DS14
     }
 
     public void Initialize()
@@ -46,19 +49,29 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
     private void RxTransferData(MsgTransferData message)
     {
         if (!_onlinePlayers.TryGetValue(message.MsgChannel.UserId, out var player)
-            || player.Impl is not TransferImplLidgren lidgren)
+            || player.Impl is not ServerTransferImplLidgren lidgren) // DS14
         {
             message.MsgChannel.Disconnect("Not lidgren");
             return;
         }
 
-        lidgren.ReceiveData(message);
+        // DS14-start
+        try
+        {
+            lidgren.ReceiveData(message);
+        }
+        catch (Exception e)
+        {
+            Sawmill.Warning($"Invalid transfer from {message.MsgChannel}: {e}");
+            message.MsgChannel.Disconnect("Invalid transfer data");
+        }
+        // DS14-end
     }
 
     private void RxTransferAckInit(MsgTransferAckInit message)
     {
         if (!_onlinePlayers.TryGetValue(message.MsgChannel.UserId, out var player)
-            || player.Impl is not TransferImplLidgren lidgren)
+            || player.Impl is not ServerTransferImplLidgren lidgren) // DS14
         {
             message.MsgChannel.Disconnect("Not lidgren");
             return;
@@ -130,11 +143,11 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
         BaseTransferImpl impl;
         if (transferHttpEnabled)
         {
-            impl = new ServerTransferImplWebSocket(Sawmill, this, _cfg, _netManager, channel);
+            impl = new ServerTransferImplWebSocket(Sawmill, this, _cfg, _netManager, channel, _taskManager); // DS14
         }
         else
         {
-            impl = new TransferImplLidgren(Sawmill, channel, this, _netManager);
+            impl = new ServerTransferImplLidgren(Sawmill, channel, this, _netManager, _taskManager); // DS14
         }
 
         impl.MaxChannelCount = _cfg.GetCVar(CVars.TransferStreamLimit);
@@ -144,7 +157,13 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
             Impl = impl,
         };
 
-        _onlinePlayers.Add(channel.UserId, datum);
+        // DS14-start
+        if (!_onlinePlayers.TryAdd(channel.UserId, datum))
+        {
+            impl.Dispose();
+            throw new InvalidOperationException("Player already has a transfer connection");
+        }
+        // DS14-end
 
         await impl.ServerInit();
     }
@@ -157,7 +176,7 @@ internal sealed class ServerTransferManager : BaseTransferManager, ITransferMana
 
     private void NetManagerOnDisconnect(object? sender, NetDisconnectedArgs e)
     {
-        if (!_onlinePlayers.Remove(e.Channel.UserId, out var player))
+        if (!_onlinePlayers.TryRemove(e.Channel.UserId, out var player)) // DS14
             return;
 
         Sawmill.Debug("Cleaning up connection for channel {Player} that disconnected", e.Channel);

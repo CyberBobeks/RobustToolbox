@@ -1,4 +1,9 @@
-﻿using System;
+using System;
+using System.Buffers;
+using System.IO;
+using System.Net.WebSockets;
+using System.Threading.Channels;
+using Robust.Shared.Asynchronous;
 using System.Net;
 using System.Security.Cryptography;
 using System.Threading;
@@ -14,8 +19,19 @@ using Robust.Shared.Utility;
 
 namespace Robust.Server.Network.Transfer;
 
-internal sealed class ServerTransferImplWebSocket : TransferImplWebSocket
+internal sealed class ServerTransferImplWebSocket : ServerTransferImpl // DS14
 {
+    // DS14-start
+    internal const string KeyHeaderName = "RT-Key";
+    internal const string UserIdHeaderName = "RT-UserId";
+    internal const int RandomKeyBytes = 32;
+    private readonly CancellationTokenSource _readCancel = new();
+    private readonly CancellationToken _readToken;
+    private int _disposed;
+    public WebSocket? WebSocket;
+    protected override bool BoundedChannel => true;
+    // DS14-end
+
     private readonly IConfigurationManager _cfg;
     private readonly INetManager _netManager;
     private readonly SemaphoreSlim _apiLock = new(1, 1);
@@ -30,9 +46,11 @@ internal sealed class ServerTransferImplWebSocket : TransferImplWebSocket
         BaseTransferManager parent,
         IConfigurationManager cfg,
         INetManager netManager,
-        INetChannel channel)
-        : base(sawmill, parent, channel)
+        INetChannel channel,
+        ITaskManager tasks) // DS14
+        : base(sawmill, parent, channel, tasks) // DS14
     {
+        _readToken = _readCancel.Token; // DS14
         _cfg = cfg;
         _netManager = netManager;
     }
@@ -71,7 +89,7 @@ internal sealed class ServerTransferImplWebSocket : TransferImplWebSocket
 
     public async Task HandleApiRequest(NetUserId userId, IStatusHandlerContext context)
     {
-        using var _ = await _apiLock.WaitGuardAsync();
+        using var apiGuard = await _apiLock.WaitGuardAsync(); // DS14
 
         if (Key == null)
         {
@@ -105,6 +123,14 @@ internal sealed class ServerTransferImplWebSocket : TransferImplWebSocket
         Sawmill.Debug("Client connect to transfer WS channel: {UserId}", userId);
 
         WebSocket = await context.AcceptWebSocketAsync();
+        // DS14-start
+        if (Volatile.Read(ref _disposed) != 0 || !Channel.IsConnected)
+        {
+            WebSocket.Dispose();
+            _connectTcs.TrySetCanceled();
+            return;
+        }
+        // DS14-end
 
         // We've connected.
         // Clear key so this can't be reconnected to.
@@ -112,11 +138,133 @@ internal sealed class ServerTransferImplWebSocket : TransferImplWebSocket
 
         _connectTcs.TrySetResult();
 
-        ReadThread();
+        _ = ReadThread(); // DS14
     }
+
+    // DS14-start
+    public override Stream StartTransfer(TransferStartInfo startInfo)
+    {
+        if (WebSocket == null)
+            throw new InvalidOperationException("Player not connected yet");
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+        var id = Interlocked.Increment(ref OutgoingIdCounter);
+
+        return new SendStream(this, id, startInfo.MessageKey);
+    }
+
+    internal async Task ReadThread()
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+        DebugTools.Assert(WebSocket != null);
+        var ws = WebSocket;
+        var headerBuffer = ArrayPool<byte>.Shared.Rent(MaxHeaderSize);
+        var cancel = _readToken;
+
+        try
+        {
+            while (!cancel.IsCancellationRequested)
+            {
+                // A single WebSocket message may require multiple ReceiveAsync calls.
+                var headerLength = 0;
+                ValueWebSocketReceiveResult receiveResult;
+                do
+                {
+                    if (headerLength == MaxHeaderSize)
+                        throw new ProtocolViolationException("Transfer header too large");
+                    receiveResult = await ws!.ReceiveAsync(
+                        headerBuffer.AsMemory(headerLength, MaxHeaderSize - headerLength), cancel).ConfigureAwait(false);
+                    BaseTransferManager.ReceivedDataMetrics.Inc(receiveResult.Count);
+                    if (receiveResult.MessageType != WebSocketMessageType.Binary)
+                        throw new ProtocolViolationException("Data must be binary!");
+                    headerLength += receiveResult.Count;
+                } while (!receiveResult.EndOfMessage);
+                var receivedData = headerBuffer.AsMemory(0, headerLength);
+                ReceiveHeader(receivedData, out var flags, out var transferId, out var channel);
+
+                if ((flags & TransferFlags.HasData) != 0)
+                    await ReceiveTransferData(ws!, channel, cancel).ConfigureAwait(false);
+
+                FinishReceivedData(flags, transferId, channel);
+            }
+        }
+        // Local disconnect/shutdown is normal, not a second network error.
+        catch (Exception) when (cancel.IsCancellationRequested)
+        {
+        }
+        catch (Exception e)
+        {
+            Sawmill.Error($"Error reading transfer socket: {e}");
+            DisconnectChannel("Error in transfer socket");
+        }
+        finally
+        {
+            base.Dispose();
+            ArrayPool<byte>.Shared.Return(headerBuffer);
+        }
+    }
+
+    private sealed class SendStream : ServerSendStream
+    {
+        public SendStream(ServerTransferImplWebSocket parent, long id, string key) : base(parent, id, key)
+        {
+        }
+
+        protected override async ValueTask SendChunkAsync(ArraySegment<byte> buffer, CancellationToken cancel)
+        {
+            var ws = ((ServerTransferImplWebSocket)Parent).WebSocket!;
+
+            BaseTransferManager.SentDataMetrics.Inc(buffer.Count);
+
+            await ws.SendAsync(
+                    buffer,
+                    WebSocketMessageType.Binary,
+                    endOfMessage: true,
+                    cancel)
+                .ConfigureAwait(false);
+        }
+    }
+
+    private static async ValueTask ReceiveTransferData(
+        WebSocket ws,
+        ChannelWriter<ArraySegment<byte>> channel,
+        CancellationToken cancel)
+    {
+        while (!cancel.IsCancellationRequested)
+        {
+            var buf = ArrayPool<byte>.Shared.Rent(BufferSize);
+            // Return buffers also when receive or queueing fails.
+            try
+            {
+                var result = await ws.ReceiveAsync(buf.AsMemory(0, BufferSize), cancel).ConfigureAwait(false);
+                BaseTransferManager.ReceivedDataMetrics.Inc(result.Count);
+                if (result.MessageType != WebSocketMessageType.Binary)
+                    throw new ProtocolViolationException("Data must be binary!");
+                await channel.WriteAsync(new ArraySegment<byte>(buf, 0, result.Count), cancel).ConfigureAwait(false);
+                buf = null!; // Ownership passed to ReceiveStream.
+                if (result.EndOfMessage)
+                    break;
+            }
+            finally
+            {
+                if (buf != null)
+                    ArrayPool<byte>.Shared.Return(buf);
+            }
+        }
+    }
+
+    // DS14-end
 
     public override void Dispose()
     {
+        // DS14-start
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
         _connectTcs.TrySetCanceled();
+        _readCancel.Cancel();
+        base.Dispose();
+        WebSocket?.Dispose();
+        _readCancel.Dispose();
+        // DS14-end
     }
 }
