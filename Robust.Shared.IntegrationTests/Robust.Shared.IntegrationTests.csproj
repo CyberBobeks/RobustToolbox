@@ -19,6 +19,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- DS14-start -->
+    <ProjectReference Include="..\Lidgren.Network\Lidgren.Network.csproj" />
+    <!-- DS14-end -->
     <ProjectReference Include="..\NetSerializer\NetSerializer\NetSerializer.csproj" />
     <ProjectReference Include="..\Robust.Client\Robust.Client.csproj" />
     <ProjectReference Include="..\Robust.Server.Testing\Robust.Server.Testing.csproj" />
